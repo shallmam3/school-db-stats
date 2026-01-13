@@ -3,24 +3,31 @@ import subprocess
 import os
 import json
 import requests
-import time
+import re
 from bs4 import BeautifulSoup
 import pandas as pd
 
-# --- 1. 环境初始化 ---
+# --- 1. 环境与依赖 ---
+# 既然是读文章，不需要笨重的 Playwright 了，普通的 requests 就够了，速度更快
 if "playwright_installed" not in st.session_state:
-    if not os.path.exists(os.path.expanduser("~/.cache/ms-playwright")):
-        with st.spinner("正在初始化云端浏览器..."):
-            subprocess.run(["playwright", "install", "chromium"])
     st.session_state.playwright_installed = True
 
-try:
-    from playwright.sync_api import sync_playwright
-except ImportError:
-    st.error("请检查 requirements.txt 是否包含 playwright")
-    st.stop()
-
-# --- 2. 核心功能函数 ---
+# --- 2. 核心：主流数据库词典 (你可以随时补充) ---
+# 这是我们在文章中“寻找”的目标
+COMMON_DBS = {
+    "CN": [
+        "中国知网", "CNKI", "万方", "维普", "超星", "读秀", "龙源", 
+        "人大复印", "CSCD", "CSSCI", "中华医学", "国研网", "EPS数据", 
+        "新东方", "银符", "起点考试", "中科", "优阅", "书生之家"
+    ],
+    "EN": [
+        "Web of Science", "WOS", "SCI", "SSCI", "EI", "Engineering Village", 
+        "ScienceDirect", "Elsevier", "Springer", "Wiley", "IEEE", "IEL", 
+        "Nature", "Science", "ACS", "RSC", "ProQuest", "EBSCO", "JSTOR", 
+        "PubMed", "Embase", "Scopus", "Taylor", "Francis", "SAGE", 
+        "Emerald", "ACM", "ASCE", "ASME", "LexisNexis", "Westlaw"
+    ]
+}
 
 def get_api_key():
     try:
@@ -28,237 +35,162 @@ def get_api_key():
     except:
         return None
 
-def google_search_lib_url(school_name, api_key):
+def google_search_articles(school_name, api_key):
     """
-    第一步：只找图书馆的入口，不需要直接找到列表页
-    让 Playwright 去做具体的点击工作
+    搜索策略转变：找文章、找指南、找概览
     """
     url = "https://google.serper.dev/search"
-    # 搜索策略：优先找图书馆官网，或者直接找数据库页
     queries = [
-        f"{school_name} 图书馆 官网",
-        f"{school_name} 图书馆 数据库",
+        f"{school_name} 图书馆 \"数字资源\" 导览",
+        f"{school_name} 图书馆 \"已购数据库\" 一览",
+        f"{school_name} 图书馆 新生入馆指南 资源介绍",
+        f"site:mp.weixin.qq.com {school_name} 图书馆 数据库" # 专门搜微信推文
     ]
     
     headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json; charset=utf-8'}
 
+    links = []
     for query in queries:
         try:
             payload = json.dumps({"q": query, "gl": "cn", "hl": "zh-cn"}, ensure_ascii=False).encode('utf-8')
-            response = requests.post(url, headers=headers, data=payload, timeout=10)
+            response = requests.post(url, headers=headers, data=payload, timeout=5)
             if response.status_code == 200:
                 results = response.json()
-                if 'organic' in results and len(results['organic']) > 0:
-                    return results['organic'][0]['link']
+                if 'organic' in results:
+                    # 取前3个结果，增加命中率
+                    for item in results['organic'][:3]:
+                        links.append({
+                            "title": item.get('title'),
+                            "link": item.get('link'),
+                            "snippet": item.get('snippet')
+                        })
         except:
             continue
-    return None
-
-def extract_from_table(soup):
-    """表格提取逻辑 (保持不变，因为这是对的)"""
-    db_list = []
-    tables = soup.find_all('table')
     
-    for table in tables:
-        text_content = table.get_text()
-        keywords = ["数据库", "资源", "题名", "已购", "订购", "中文", "外文"]
-        # 如果表格里没有这些关键词，就跳过
-        if sum(1 for k in keywords if k in text_content) < 2:
-            continue
-            
-        rows = table.find_all('tr')
-        for row in rows:
-            cells = row.find_all(['td', 'th'])
-            for cell in cells:
-                links = cell.find_all('a')
-                for link in links:
-                    text = link.get_text(strip=True)
-                    if 2 < len(text) < 60:
-                        db_list.append(text)
-                if not links:
-                     text = cell.get_text(strip=True)
-                     if 2 < len(text) < 60 and not text.isdigit():
-                         db_list.append(text)
-    return db_list
+    # 去重
+    seen = set()
+    unique_links = []
+    for l in links:
+        if l['link'] not in seen:
+            unique_links.append(l)
+            seen.add(l['link'])
+    return unique_links[:5] # 最多分析5篇
 
-def automated_browser_workflow(start_url):
+def analyze_page_content(url):
     """
-    【真正的自动化核心】
-    1. 进入页面
-    2. 如果当前页面没有表格，自动寻找“已购资源”、“电子资源”按钮并点击
-    3. 提取数据
+    抓取文章内容并进行“词典匹配”
     """
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0 Safari/537.36')
-        page = context.new_page()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.encoding = resp.apparent_encoding # 自动纠正编码
+        text = BeautifulSoup(resp.text, 'html.parser').get_text()
         
-        print(f"正在访问: {start_url}")
-        try:
-            page.goto(start_url, timeout=30000, wait_until="domcontentloaded")
-            time.sleep(2) # 等待渲染
-            
-            # --- 智能跳转逻辑 ---
-            # 检查当前页面有没有目标表格
-            initial_content = page.content()
-            initial_soup = BeautifulSoup(initial_content, 'html.parser')
-            initial_data = extract_from_table(initial_soup)
-            
-            # 如果当前页面直接就有数据，太好了，直接返回
-            if len(initial_data) > 10:
-                print("直接在着陆页找到数据")
-                browser.close()
-                return initial_data
+        found_cn = set()
+        found_en = set()
+        
+        # 1. 扫描中文库
+        for db in COMMON_DBS["CN"]:
+            # 简单的不区分大小写匹配
+            if db.lower() in text.lower():
+                found_cn.add(db)
+                
+        # 2. 扫描外文库
+        for db in COMMON_DBS["EN"]:
+            # 单词边界匹配防止误判 (例如搜 EI 不匹配 height)
+            if re.search(r'\b' + re.escape(db) + r'\b', text, re.IGNORECASE) or db in text:
+                found_en.add(db)
+                
+        return list(found_cn), list(found_en)
+    except Exception as e:
+        return [], []
 
-            # 如果没有，开始寻找入口链接并点击
-            print("当前页面未发现表格，尝试点击导航...")
-            
-            # 常见的入口关键词，按优先级排序
-            keywords = ["已购资源", "中文数据库", "电子资源", "数据库导航", "所有数据库", "订购资源"]
-            
-            found_click = False
-            for kw in keywords:
-                try:
-                    # 寻找包含关键词的链接
-                    # 使用 Playwright 的定位器，模糊匹配文本
-                    link = page.get_by_text(kw, exact=False).first
-                    if link.is_visible():
-                        print(f"--> 点击跳转: {kw}")
-                        link.click(timeout=3000)
-                        page.wait_for_load_state("domcontentloaded", timeout=10000)
-                        time.sleep(3) # 等待跳转后的表格渲染
-                        found_click = True
-                        break # 跳过一次后，通常就是目标页了
-                except Exception as e:
-                    continue # 没找到这个词，找下一个
-            
-            if not found_click:
-                print("未找到明显的跳转链接，尝试在当前页硬解析")
+# --- 3. UI 界面 ---
+st.set_page_config(page_title="高校资源情报分析", page_icon="🕵️", layout="wide")
 
-            # --- 最终提取 ---
-            final_content = page.content()
-            browser.close()
-            
-            final_soup = BeautifulSoup(final_content, 'html.parser')
-            final_data = extract_from_table(final_soup)
-            
-            # 兜底：如果表格提取还是空的，试着用列表方式提取
-            if len(final_data) < 5:
-                # 清理干扰项
-                for tag in final_soup(['header', 'footer', 'nav', 'script', 'style']):
-                    tag.decompose()
-                clean_links = []
-                for link in final_soup.find_all('a'):
-                    txt = link.get_text(strip=True)
-                    if 4 < len(txt) < 50:
-                        clean_links.append(txt)
-                return clean_links
+st.title("🕵️ 高校数据库资源情报分析")
+st.caption("思路：通过搜索公开的“入馆指南”、“资源导览”或“新闻通告”，匹配主流数据库名单。")
 
-            return final_data
+with st.sidebar:
+    st.header("⚙️ 设置")
+    api_key = st.text_input("SERPER_API_KEY", value=get_api_key() or "", type="password")
+    
+school_input = st.text_input("请输入学校全称", placeholder="例如：西安科技大学")
+run_btn = st.button("开始侦察", type="primary")
 
-        except Exception as e:
-            print(f"Browser Error: {e}")
-            browser.close()
-            return []
-
-def is_chinese(string):
-    for char in string:
-        if '\u4e00' <= char <= '\u9fa5': return True
-    return False
-
-def clean_data(raw_list):
-    blacklist = [
-        "首页", "登录", "注册", "更多", "查看", "订购", "试用", "简介", "指南", 
-        "详细", "访问", "校外", "咨询", "反馈", "点击", "下载", "English",
-        "序号", "状态", "类型", "名称", "数据库名称", "操作", "来源", "链接", 
-        "提交", "部门", "版权", "所有", "导航", "服务", "概况"
-    ]
-    clean_list = []
-    for item in raw_list:
-        text = item.strip()
-        if 2 < len(text) < 60 and not text.isdigit():
-            if not any(junk in text for junk in blacklist):
-                clean_list.append(text)
-    return list(set(clean_list))
-
-# --- 3. UI 界面 (回归简洁) ---
-st.set_page_config(page_title="高校数据库自动统计", page_icon="🏫", layout="wide")
-
-st.title("🏫 高校数据库全自动统计")
-st.caption("输入校名 -> 自动进入图书馆 -> 自动寻找已购资源 -> 输出统计")
-
-# 简单的输入区
-col1, col2 = st.columns([3, 1])
-with col1:
-    school_input = st.text_input("请输入学校全称", placeholder="例如：西安科技大学", label_visibility="collapsed")
-with col2:
-    start_btn = st.button("开始自动化分析", type="primary", use_container_width=True)
-
-api_key = get_api_key()
-
-if start_btn:
+if run_btn:
     if not api_key:
-        st.error("请在后台配置 SERPER_API_KEY")
+        st.error("请配置 SERPER_API_KEY")
         st.stop()
-    
     if not school_input:
-        st.warning("请输入学校名称")
+        st.warning("请输入校名")
         st.stop()
 
-    status = st.status("🚀 正在启动自动化程序...", expanded=True)
+    status = st.status("🔍 正在全网搜索相关情报...", expanded=True)
     
-    # 1. 搜索入口
-    status.write(f"🔍 正在搜索 {school_input} 图书馆官网...")
-    start_url = google_search_lib_url(school_input, api_key)
+    # 1. 搜索文章
+    articles = google_search_articles(school_input, api_key)
     
-    if start_url:
-        status.write(f"🌐 找到入口: {start_url}")
-        status.write("🤖 正在模拟浏览器访问，寻找“已购资源”表格...")
+    if not articles:
+        status.update(label="❌ 未找到公开情报", state="error")
+        st.error("未搜索到相关文章，该学校可能较少公开详细资源列表。")
+    else:
+        status.write(f"📄 找到 {len(articles)} 篇相关公开文档/文章，开始分析内容...")
         
-        # 2. 自动化浏览 + 智能跳转
-        raw_dbs = automated_browser_workflow(start_url)
+        all_cn = set()
+        all_en = set()
+        valid_sources = []
         
-        # 3. 数据清洗
-        final_dbs = clean_data(raw_dbs)
-        cn_dbs = sorted([d for d in final_dbs if is_chinese(d)])
-        en_dbs = sorted([d for d in final_dbs if not is_chinese(d)])
-        total = len(cn_dbs) + len(en_dbs)
-        
-        status.update(label="✅ 完成！", state="complete", expanded=False)
+        # 2. 逐篇分析
+        progress_bar = status.progress(0)
+        for i, article in enumerate(articles):
+            status.write(f"正在阅读: [{article['title']}]...")
+            cn, en = analyze_page_content(article['link'])
+            
+            if cn or en:
+                all_cn.update(cn)
+                all_en.update(en)
+                valid_sources.append(article)
+            
+            progress_bar.progress((i + 1) / len(articles))
+            
+        status.update(label="✅ 分析完成！", state="complete", expanded=False)
         
         # --- 结果展示 ---
         st.divider()
-        st.markdown(f"### 📊 {school_input} 统计结果")
-        st.caption(f"数据最终来源页: {start_url}") # 这里的URL可能是跳转前的，主要作参考
+        total = len(all_cn) + len(all_en)
         
-        if total == 0:
-            st.error("⚠️ 未提取到有效数据。")
-            st.info("可能有以下原因：\n1. 该学校官网必须校内VPN才能访问。\n2. 网页结构极其特殊，自动化点击未命中。")
-        else:
-            # 统计卡片
-            c1, c2, c3 = st.columns(3)
-            c1.metric("📚 总计资源", total)
-            c2.metric("🇨🇳 中文数据库", len(cn_dbs))
-            c3.metric("🌍 外文数据库", len(en_dbs))
-            
-            st.divider()
-            
-            # 双栏列表
-            c_left, c_right = st.columns(2)
-            with c_left:
-                st.subheader(f"中文数据库 ({len(cn_dbs)})")
-                if cn_dbs:
-                    df = pd.DataFrame(cn_dbs, columns=["名称"])
-                    df.index += 1
-                    st.dataframe(df, use_container_width=True)
-            
-            with c_right:
-                st.subheader(f"外文数据库 ({len(en_dbs)})")
-                if en_dbs:
-                    df = pd.DataFrame(en_dbs, columns=["名称"])
-                    df.index += 1
-                    st.dataframe(df, use_container_width=True)
-            
-    else:
-        status.update(label="❌ 搜索失败", state="error")
-        st.error("无法找到该学校图书馆官网，请检查校名是否正确。")
+        # 顶部 KPI
+        c1, c2, c3 = st.columns(3)
+        c1.metric("疑似已购资源", total, help="通过关键词匹配到的主流数据库数量")
+        c2.metric("中文核心", len(all_cn))
+        c3.metric("外文核心", len(all_en))
+        
+        st.info(f"💡 分析结论：根据公开信息，该校极大概率拥有以下资源。数据来源于对 {len(valid_sources)} 篇公开文章的文本分析。")
+
+        # 详细列表
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("🇨🇳 中文资源 (匹配命中)")
+            if all_cn:
+                # 转换成 DataFrame 显示更好看
+                df_cn = pd.DataFrame(sorted(list(all_cn)), columns=["数据库名称"])
+                st.dataframe(df_cn, use_container_width=True, hide_index=True)
+            else:
+                st.text("未检测到常见中文库")
+                
+        with col2:
+            st.subheader("🌍 外文资源 (匹配命中)")
+            if all_en:
+                df_en = pd.DataFrame(sorted(list(all_en)), columns=["数据库名称"])
+                st.dataframe(df_en, use_container_width=True, hide_index=True)
+            else:
+                st.text("未检测到常见外文库")
+
+        st.divider()
+        st.markdown("#### 🔗 证据来源 (点击查看原文)")
+        for src in valid_sources:
+            st.markdown(f"- [{src['title']}]({src['link']})")
+            st.caption(f"摘要: {src['snippet']}")
