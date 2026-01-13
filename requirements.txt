@@ -5,3 +5,4 @@ duckduckgo-search
 pandas
 lxml
 openpyxl
+playwright
