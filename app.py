@@ -4,235 +4,251 @@ import os
 import json
 import requests
 import time
+import re
 from bs4 import BeautifulSoup
 import pandas as pd
 from collections import Counter
 
-# --- 1. 环境自检与初始化 (Playwright) ---
-# 确保云端环境安装了浏览器内核
+# --- 1. 环境初始化 ---
 if "playwright_installed" not in st.session_state:
     if not os.path.exists(os.path.expanduser("~/.cache/ms-playwright")):
-        with st.spinner("正在初始化云端浏览器组件... (首次运行约需1分钟)"):
+        with st.spinner("正在初始化云端浏览器..."):
             subprocess.run(["playwright", "install", "chromium"])
     st.session_state.playwright_installed = True
 
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:
-    st.error("严重错误：未找到 playwright 库。请检查 requirements.txt")
+    st.error("请检查 requirements.txt 是否包含 playwright")
     st.stop()
 
 # --- 2. 核心功能函数 ---
 
 def get_api_key():
-    """从后台读取 API Key"""
     try:
         return st.secrets["SERPER_API_KEY"]
-    except Exception:
+    except:
         return None
 
 def google_search_url(school_name, api_key):
-    """利用 Google 搜索找到目标网址"""
+    """搜索入口 URL"""
     url = "https://google.serper.dev/search"
+    # 优化搜索词，直接找“已购资源”
     queries = [
-        f"{school_name} 图书馆 数据库 列表",
-        f"{school_name} 图书馆 电子资源 导航",
-        f"{school_name} library database list"
+        f"{school_name} 图书馆 已购资源 列表",
+        f"{school_name} 图书馆 数据库导航",
+        f"{school_name} 图书馆 电子资源"
     ]
     
-    headers = {
-        'X-API-KEY': api_key,
-        'Content-Type': 'application/json; charset=utf-8'
-    }
+    headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json; charset=utf-8'}
 
     for query in queries:
         try:
-            payload = json.dumps({
-                "q": query, 
-                "gl": "cn", 
-                "hl": "zh-cn"
-            }, ensure_ascii=False).encode('utf-8')
-
+            payload = json.dumps({"q": query, "gl": "cn", "hl": "zh-cn"}, ensure_ascii=False).encode('utf-8')
             response = requests.post(url, headers=headers, data=payload, timeout=10)
             if response.status_code == 200:
                 results = response.json()
                 if 'organic' in results and len(results['organic']) > 0:
                     return results['organic'][0]['link']
-        except Exception:
+        except:
             continue
     return None
 
-def get_dynamic_page_content(url):
-    """利用 Playwright 渲染动态网页"""
+def extract_from_table(soup):
+    """
+    【核心升级】专门识别“表格”结构 (Target: 红框内的内容)
+    只有在表格里的内容才会被提取，彻底屏蔽侧边栏干扰。
+    """
+    db_list = []
+    
+    # 找到所有的表格
+    tables = soup.find_all('table')
+    
+    for table in tables:
+        # 检查表头，确认是不是数据库列表
+        # 只要表格文字里包含这些关键词，就认为是目标表格
+        text_content = table.get_text()
+        keywords = ["数据库", "资源名称", "题名", "已购", "订购", "中文", "外文"]
+        
+        # 计算匹配到的关键词数量
+        match_count = sum(1 for k in keywords if k in text_content)
+        
+        # 如果关键词太少，说明这可能只是个排版表格，跳过
+        if match_count < 2:
+            continue
+            
+        # --- 提取表格内容 ---
+        # 遍历所有行
+        rows = table.find_all('tr')
+        for row in rows:
+            # 遍历所有单元格
+            cells = row.find_all(['td', 'th'])
+            for cell in cells:
+                # 提取链接文本
+                links = cell.find_all('a')
+                for link in links:
+                    text = link.get_text(strip=True)
+                    if 2 < len(text) < 60:
+                        db_list.append(text)
+                
+                # 如果没有链接，有时候是纯文本(但较少见，通常数据库都是链接)
+                if not links:
+                     text = cell.get_text(strip=True)
+                     if 2 < len(text) < 60 and not text.isdigit():
+                         db_list.append(text)
+
+    return db_list
+
+def smart_crawl_and_extract(url):
+    """
+    【智能探路者】
+    1. 加载页面
+    2. 如果当前页面不像列表，尝试点击“已购资源”等按钮跳转
+    3. 渲染最终页面并提取
+    """
     with sync_playwright() as p:
         try:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
+            context = browser.new_context(user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120.0.0.0 Safari/537.36')
             page = context.new_page()
             
-            # 访问页面，最长等待60秒
+            # 1. 访问初始页面
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            time.sleep(3) # 等待首屏加载
             
-            # 强制等待，确保动态内容加载完毕
-            time.sleep(5)
-            
+            # --- 智能跳转逻辑 (Deep Navigation) ---
+            # 检查当前页面是否已经是列表页（有没有“中文数据库”、“已购”等字样）
             content = page.content()
+            if "中文数据库" not in content and "已购" not in content:
+                # 如果当前页不像列表页，尝试寻找“入口”按钮并点击
+                # 模糊匹配链接文字
+                potential_links = page.get_by_role("link").all()
+                target_keywords = ["已购资源", "数据库导航", "中文数据库", "所有数据库", "订购资源"]
+                
+                for link in potential_links:
+                    try:
+                        text = link.text_content()
+                        if any(kw in text for kw in target_keywords):
+                            print(f"🕵️ 发现潜在入口: {text}，正在跳转...")
+                            # 找到入口，点击并等待加载
+                            with page.expect_navigation(timeout=15000):
+                                link.click()
+                            time.sleep(5) # 等待新页面加载
+                            break # 只跳一次
+                    except:
+                        pass
+
+            # 2. 获取最终页面内容
+            final_content = page.content()
             browser.close()
-            return content
+            
+            # --- 解析阶段 ---
+            soup = BeautifulSoup(final_content, 'html.parser')
+            
+            # 策略 A: 优先尝试从表格(Table)提取 (最精准，对应你的截图)
+            db_list = extract_from_table(soup)
+            
+            # 策略 B: 如果没找到表格，回退到之前的智能区域法 (兜底)
+            if len(db_list) < 5:
+                # (这里复用之前的逻辑，作为备用)
+                # 清理干扰
+                for tag in soup(['header', 'footer', 'nav', 'script', 'style', 'iframe', 'form']):
+                    tag.decompose()
+                
+                # 寻找最密集的区域
+                all_links = soup.find_all('a')
+                parents = []
+                for link in all_links:
+                    if 2 < len(link.get_text(strip=True)) < 60:
+                        parent = link.find_parent(['ul', 'div', 'tbody', 'section'])
+                        if parent: parents.append(parent)
+                
+                if parents:
+                    top_parent, count = Counter(parents).most_common(1)[0]
+                    if count > 5:
+                        for link in top_parent.find_all('a'):
+                            db_list.append(link.get_text(strip=True))
+
+            return db_list
+            
         except Exception as e:
-            print(f"抓取失败: {e}")
-            return None
+            print(f"Error: {e}")
+            return []
 
 def is_chinese(string):
     for char in string:
-        if '\u4e00' <= char <= '\u9fa5':
-            return True
+        if '\u4e00' <= char <= '\u9fa5': return True
     return False
 
-def analyze_html(html_content):
-    """
-    【核心升级】智能结构化解析 + 黑名单过滤
-    """
-    if not html_content:
-        return [], []
-    
-    soup = BeautifulSoup(html_content, 'html.parser')
-    
-    # 1. 暴力清理：删掉肯定不是数据库列表的区域
-    for tag in soup(['header', 'footer', 'nav', 'script', 'style', 'noscript', 'iframe', 'form', 'img']):
-        tag.decompose()
-        
-    # 2. 智能定位：寻找“含链接密度最高”的容器 (排除侧边栏)
-    all_links = soup.find_all('a')
-    parents = []
-    
-    for link in all_links:
-        text = link.get_text(strip=True)
-        # 只有长度像数据库名的链接才参与投票
-        if 2 < len(text) < 60:
-            # 寻找它的父级容器
-            parent = link.find_parent(['ul', 'div', 'table', 'tbody', 'section'])
-            if parent:
-                parents.append(parent)
-
-    # 默认全页搜索
-    target_area = soup
-    
-    # 如果找到了聚集区，且链接数量超过5个，就锁定这个区域
-    if parents:
-        top_parent, count = Counter(parents).most_common(1)[0]
-        if count > 5:
-            target_area = top_parent
-
-    # 3. 提取与黑名单过滤
-    links = target_area.find_all('a')
-    
-    # 黑名单：凡是包含这些词的，大概率是导航或功能按钮
+def clean_data(raw_list):
+    """最后一道清洗工序"""
     blacklist = [
-        "首页", "主页", "概况", "简介", "须知", "指南", "规章", "制度", 
-        "登录", "注册", "密码", "账户", "认证", "退出", "注销", "入口",
-        "新闻", "公告", "动态", "通知", "公示", "招聘", "招标", 
-        "培训", "讲座", "课程", "党建", "支部", "学习", "教育", "视频", 
-        "联系", "电话", "邮箱", "地址", "留言", "反馈", "帮助", "问答",
-        "导航", "链接", "地图", "English", "旧版", "APP", "微信", "微博",
-        "下载", "安装", "阅读器", "VPN", "校外", "访问", "提交", "更多",
-        "点击", "查看", "返回", "上一页", "下一页", "试用", "推荐", "置顶", "来源"
+        "首页", "登录", "注册", "更多", "查看", "订购", "试用", "简介", "指南", 
+        "详细", "访问", "校外", "咨询", "反馈", "点击", "下载", "English",
+        "序号", "状态", "类型", "名称", "数据库名称", "操作", "来源" # 表头词也要过滤
     ]
-    
-    db_list = []
-    for link in links:
-        text = link.get_text(strip=True)
-        
-        # 长度过滤
-        if 2 < len(text) < 60:
-            # 黑名单检查
-            is_junk = False
-            for junk in blacklist:
-                if junk in text:
-                    is_junk = True
-                    break
-            
-            # 必须不是垃圾词，且不全是数字(页码)
-            if not is_junk and not text.isdigit():
-                db_list.append(text)
-    
-    db_list = list(set(db_list))
-    cn_dbs = [db for db in db_list if is_chinese(db)]
-    other_dbs = [db for db in db_list if not is_chinese(db)]
-    
-    return cn_dbs, other_dbs
+    clean_list = []
+    for item in raw_list:
+        text = item.strip()
+        if 2 < len(text) < 60 and not text.isdigit():
+            if not any(junk in text for junk in blacklist):
+                clean_list.append(text)
+    return list(set(clean_list))
 
 # --- 3. UI 界面 ---
+st.set_page_config(page_title="高校数据库统计Pro", page_icon="🏫", layout="centered")
+st.title("🏫 高校数据库全自动统计 (Pro版)")
+st.caption("智能识别表格结构 | 自动跳转二级页面")
 
-st.set_page_config(page_title="高校数据库自动统计", page_icon="🏫", layout="centered")
-
-st.title("🏫 高校数据库全自动统计")
-st.caption("集成 Serper 自动搜索 + Playwright 动态抓取 + 智能降噪")
-
-# 获取 Key
 api_key = get_api_key()
+school_input = st.text_input("请输入学校全称", placeholder="例如：西安科技大学")
+start_btn = st.button("开始深度分析", type="primary")
 
-# 输入区
-col1, col2 = st.columns([3, 1])
-with col1:
-    school_input = st.text_input("请输入学校全称", placeholder="例如：西安科技大学", label_visibility="collapsed")
-with col2:
-    start_btn = st.button("开始分析", type="primary", use_container_width=True)
-
-# 状态区
-status_box = st.status("等待指令...", expanded=False)
+status = st.status("准备就绪", expanded=False)
 
 if start_btn:
-    if not school_input:
-        st.toast("请输入校名！")
-    elif not api_key:
-        st.error("❌ 未检测到 API Key。请在 Streamlit Cloud 后台 Settings -> Secrets 中配置 SERPER_API_KEY。")
+    if not api_key:
+        st.error("请配置 SERPER_API_KEY")
+    elif not school_input:
+        st.warning("请输入校名")
     else:
-        # 第一步：搜索
-        status_box.update(label=f"🔍 正在全网搜索【{school_input}】的数据库列表...", state="running", expanded=True)
-        target_url = google_search_url(school_input, api_key)
+        status.update(label="🔍 正在寻找数据库入口...", state="running", expanded=True)
+        url = google_search_url(school_input, api_key)
         
-        if target_url:
-            status_box.write(f"✅ 找到目标地址: {target_url}")
+        if url:
+            status.write(f"🌐 初始入口: {url}")
+            status.write("🕵️ 正在启动浏览器，尝试寻找表格数据 (包含自动跳转)...")
             
-            # 第二步：抓取
-            status_box.update(label="🚀 正在启动云端浏览器加载页面 (约10-20秒)...", state="running")
-            html_content = get_dynamic_page_content(target_url)
+            # 执行智能抓取
+            raw_dbs = smart_crawl_and_extract(url)
             
-            if html_content:
-                # 第三步：分析
-                status_box.write("✅ 页面加载成功，正在进行智能解析与过滤...")
-                cn_list, en_list = analyze_html(html_content)
-                status_box.update(label="分析完成！", state="complete", expanded=False)
-                
-                # 第四步：展示
-                total = len(cn_list) + len(en_list)
-                
-                st.divider()
-                st.markdown(f"### 📊 {school_input}")
-                st.caption(f"数据来源: {target_url}")
-                
-                if total == 0:
-                    st.warning("⚠️ 未识别到有效数据库。可能是页面结构特殊或需要校内网登录。")
-                    st.markdown(f"[点击手动访问页面检查]({target_url})")
-                else:
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("总计", total)
-                    m2.metric("中文数据库", len(cn_list))
-                    m3.metric("外文数据库", len(en_list))
-                    
-                    with st.expander("📄 查看详细清单 (已过滤导航噪音)", expanded=True):
-                        tab1, tab2 = st.tabs(["中文库", "外文库"])
-                        with tab1:
-                            st.dataframe(pd.DataFrame(cn_list, columns=["名称"]), use_container_width=True, hide_index=True)
-                        with tab2:
-                            st.dataframe(pd.DataFrame(en_list, columns=["名称"]), use_container_width=True, hide_index=True)
+            # 清洗
+            final_dbs = clean_data(raw_dbs)
+            
+            cn_dbs = [d for d in final_dbs if is_chinese(d)]
+            en_dbs = [d for d in final_dbs if not is_chinese(d)]
+            total = len(cn_dbs) + len(en_dbs)
+            
+            status.update(label="✅ 分析完成！", state="complete", expanded=False)
+            
+            st.divider()
+            st.markdown(f"### 📊 {school_input} 分析报告")
+            st.caption(f"数据来源: {url}")
+            
+            if total == 0:
+                st.error("未提取到有效数据。可能原因：页面需要校内网(VPN)才能看到表格，或者反爬虫非常严格。")
             else:
-                status_box.update(label="❌ 浏览器加载页面失败", state="error")
-                st.error("网页加载超时，无法获取内容。")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("总计", total)
+                m2.metric("中文库", len(cn_dbs))
+                m3.metric("外文库", len(en_dbs))
+                
+                with st.expander("📄 查看详细清单 (已剔除侧边栏干扰)", expanded=True):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.dataframe(pd.DataFrame(cn_dbs, columns=["中文数据库"]), use_container_width=True)
+                    with c2:
+                        st.dataframe(pd.DataFrame(en_dbs, columns=["外文数据库"]), use_container_width=True)
         else:
-            status_box.update(label="❌ 自动搜索失败", state="error")
-            st.warning("Google 未能找到该学校明确的数据库列表页面。")
-            manual_url = st.text_input("请手动粘贴网址尝试：")
+            status.update(label="❌ 搜索失败", state="error")
+            st.error("未找到相关网页。")
