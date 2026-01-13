@@ -1,55 +1,41 @@
 import streamlit as st
-import requests
+from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import pandas as pd
-import json
-
-# --- 核心配置 ---
-st.set_page_config(
-    page_title="高校数据库统计", 
-    page_icon="📱",
-    layout="centered" # 手机端使用 centered 布局视觉更聚焦
-)
+import time
 
 # --- 核心逻辑 ---
 
-def get_api_key():
-    """安全地从 Streamlit Secrets 获取 Key"""
-    try:
-        return st.secrets["SERPER_API_KEY"]
-    except FileNotFoundError:
-        st.error("❌ 未配置 API Key！请在 Streamlit Cloud 后台 Settings -> Secrets 中添加 SERPER_API_KEY。")
-        return None
-
-def google_search_url(school_name, api_key):
-    """搜索逻辑"""
-    url = "https://google.serper.dev/search"
-    queries = [
-        f"{school_name} 图书馆 数据库 列表",
-        f"{school_name} 图书馆 电子资源 导航",
-    ]
-    
-    headers = {
-        'X-API-KEY': api_key,
-        'Content-Type': 'application/json; charset=utf-8'
-    }
-
-    for query in queries:
+def get_dynamic_page_content(url):
+    """
+    使用 Playwright 加载动态网页（针对超星/AJAX页面）
+    """
+    with sync_playwright() as p:
+        # 启动一个浏览器（headless=True 表示不显示界面，速度更快）
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        
         try:
-            payload = json.dumps({
-                "q": query, 
-                "gl": "cn", 
-                "hl": "zh-cn"
-            }, ensure_ascii=False).encode('utf-8')
-
-            response = requests.post(url, headers=headers, data=payload, timeout=10)
-            if response.status_code == 200:
-                results = response.json()
-                if 'organic' in results and len(results['organic']) > 0:
-                    return results['organic'][0]['link']
-        except Exception:
-            continue
-    return None
+            print(f"正在加载页面: {url}")
+            page.goto(url, timeout=30000) # 30秒超时
+            
+            # 关键点：等待页面上的特定元素加载出来
+            # 我们等待页面上出现看起来像链接或列表的东西
+            # 如果你知道具体的 CSS 选择器最好，不知道的话等待网络空闲
+            page.wait_for_load_state("networkidle") 
+            
+            # 为了保险，多等 2 秒让 JS 渲染完
+            time.sleep(2)
+            
+            # 获取渲染后的完整 HTML
+            content = page.content()
+            return content
+            
+        except Exception as e:
+            st.error(f"Playwright 加载失败: {e}")
+            return None
+        finally:
+            browser.close()
 
 def is_chinese(string):
     for char in string:
@@ -57,91 +43,73 @@ def is_chinese(string):
             return True
     return False
 
-def analyze_page(url):
-    headers = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'}
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        response.encoding = response.apparent_encoding
-        soup = BeautifulSoup(response.text, 'html.parser')
+def analyze_html(html_content):
+    """解析 HTML 内容"""
+    if not html_content:
+        return [], []
         
-        for tag in soup(['header', 'footer', 'nav', 'script', 'style', 'noscript']):
-            tag.decompose()
-        
-        links = soup.find_all('a')
-        db_list = []
-        for link in links:
-            text = link.get_text(strip=True)
-            if 3 < len(text) < 50: 
-                db_list.append(text)
-        
-        db_list = list(set(db_list))
-        cn_dbs = [db for db in db_list if is_chinese(db)]
-        other_dbs = [db for db in db_list if not is_chinese(db)]
-        return cn_dbs, other_dbs
-    except Exception as e:
-        return None, None
-
-# --- 手机端 UI 优化 ---
-
-st.markdown("### 🏫 高校数据库统计")
-st.caption("自动搜索并统计图书馆购买的数据库数量")
-
-# 1. 简洁的输入区
-col1, col2 = st.columns([3, 1])
-with col1:
-    school_input = st.text_input("输入校名", placeholder="例如：陕西师范大学", label_visibility="collapsed")
-with col2:
-    start_btn = st.button("开始", type="primary", use_container_width=True)
-
-# 2. 状态显示区（用较小的字体）
-status_container = st.empty()
-
-if start_btn:
-    api_key = get_api_key()
+    soup = BeautifulSoup(html_content, 'html.parser')
     
-    if not school_input:
-        st.toast("⚠️ 请输入学校名称")
-    elif api_key:
-        
-        # 步骤 A: 搜索
-        status_container.info("🔍 正在寻找数据库网页...")
-        target_url = google_search_url(school_input, api_key)
-        
-        if target_url:
-            # 步骤 B: 分析
-            status_container.success(f"✅ 找到网页，正在分析...")
-            cn_list, en_list = analyze_page(target_url)
+    # 清理干扰项
+    for tag in soup(['header', 'footer', 'nav', 'script', 'style', 'noscript']):
+        tag.decompose()
+    
+    links = soup.find_all('a')
+    db_list = []
+    
+    for link in links:
+        text = link.get_text(strip=True)
+        # 稍微放宽过滤条件
+        if 2 < len(text) < 50: 
+            db_list.append(text)
+    
+    db_list = list(set(db_list))
+    
+    cn_dbs = [db for db in db_list if is_chinese(db)]
+    other_dbs = [db for db in db_list if not is_chinese(db)]
             
-            status_container.empty() # 清空状态栏，展示结果
+    return cn_dbs, other_dbs
+
+# --- UI 界面 ---
+
+st.set_page_config(page_title="动态网页数据库抓取", page_icon="🕵️")
+
+st.title("🕵️ 超星/动态网页抓取助手")
+st.markdown("专门解决“浏览器能看到，程序搜不到”的问题。")
+
+target_url = st.text_input("请输入网址：", value="http://wisdom.chaoxing.com/newwisdom/doordatabase/database.html?pageId=48038&wfwfid=1803&sw=")
+
+if st.button("开始强力抓取"):
+    if not target_url:
+        st.warning("请先输入网址")
+    else:
+        with st.status("🚀 正在启动仿真浏览器...", expanded=True) as status:
             
-            if cn_list is not None:
-                total = len(cn_list) + len(en_list)
+            # 1. 获取动态内容
+            html_content = get_dynamic_page_content(target_url)
+            
+            if html_content:
+                status.write("✅ 页面加载成功！正在解析数据...")
                 
-                # --- 核心结果区 (大字号卡片) ---
+                # 2. 解析
+                cn_list, en_list = analyze_html(html_content)
+                
+                status.update(label="分析完成！", state="complete", expanded=False)
+                
+                # 3. 展示结果
                 st.divider()
-                st.markdown(f"**{school_input}**")
+                st.success(f"📊 抓取结果统计")
                 
-                # 使用原生 metric，手机会自动堆叠
-                m1, m2, m3 = st.columns(3)
-                m1.metric("总计", total)
-                m2.metric("中文", len(cn_list))
-                m3.metric("外文", len(en_list))
+                col1, col2, col3 = st.columns(3)
+                col1.metric("中文数据库", f"{len(cn_list)}")
+                col2.metric("外文/其他", f"{len(en_list)}")
+                col3.metric("总计", f"{len(cn_list) + len(en_list)}")
                 
-                st.divider()
-                
-                # --- 详情区 (默认折叠，节省手机空间) ---
-                with st.expander("📄 查看详细名单 (点击展开)"):
-                    st.markdown("**🇨🇳 中文数据库**")
-                    st.dataframe(pd.DataFrame(cn_list, columns=["名称"]), hide_index=True, use_container_width=True)
-                    
-                    st.markdown("**🌍 外文/其他数据库**")
-                    st.dataframe(pd.DataFrame(en_list, columns=["名称"]), hide_index=True, use_container_width=True)
-                    
-                st.caption(f"数据来源: {target_url}")
-                
+                tab1, tab2 = st.tabs(["📝 中文库清单", "🌍 外文库清单"])
+                with tab1:
+                    st.dataframe(pd.DataFrame(cn_list, columns=["名称"]), use_container_width=True)
+                with tab2:
+                    st.dataframe(pd.DataFrame(en_list, columns=["名称"]), use_container_width=True)
             else:
-                st.error("无法读取页面，可能有防火墙拦截。")
-        else:
-            status_container.warning("未找到该学校的公开数据库列表。")
-            # 兜底：允许手动输入
-            manual_url = st.text_input("尝试手动粘贴网址：")
+                status.update(label="抓取失败", state="error")
+                st.error("未能获取页面内容，可能是因为网页有反爬虫验证或加载超时。")
